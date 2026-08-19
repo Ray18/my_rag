@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>My RAG · 知识库问答</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <div class="app">
+
+    <!-- ===== 左侧：知识库栏 ===== -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-logo">RAG</div>
+        <div class="brand-text">
+          <h1>My RAG</h1>
+          <p>知识库问答</p>
+        </div>
+      </div>
+
+      <section class="card upload-card">
+        <h2>上传文档</h2>
+        <div class="drop-zone" id="dropZone" tabindex="0" role="button"
+             aria-label="上传文档：拖拽或点击选择">
+          <input type="file" id="fileInput" accept=".pdf,.doc,.docx" hidden>
+          <div class="drop-icon">📄</div>
+          <p class="drop-text">拖拽文档到这里<br>或 <span class="link">点击选择</span></p>
+          <p class="drop-hint">支持 PDF / Word，单文件 ≤ 50MB</p>
+        </div>
+        <div id="uploadStatus" class="upload-status"></div>
+      </section>
+
+      <section class="card docs-card">
+        <h2>已上传文档</h2>
+        <ul id="docList" class="doc-list"></ul>
+        <p id="docEmpty" class="doc-empty">还没有上传文档，先传一份吧 📚</p>
+      </section>
+
+      <footer class="sidebar-footer">
+        <span>向量库 · Elasticsearch</span>
+        <span>模型 · DeepSeek</span>
+      </footer>
+    </aside>
+
+    <!-- ===== 右侧：聊天区 ===== -->
+    <main class="chat">
+      <header class="chat-header">
+        <h2>知识库问答</h2>
+        <button id="newChatBtn" class="btn-ghost" type="button">新对话</button>
+      </header>
+
+      <div id="messages" class="messages"></div>
+
+      <div class="composer">
+        <textarea id="chatInput" rows="1" spellcheck="false"
+                  placeholder="输入问题，Enter 发送，Shift+Enter 换行"></textarea>
+        <button id="sendBtn" class="btn-primary" type="button">发送</button>
+      </div>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+  <script src="/js/app.js"></script>
+</body>
+</html>
