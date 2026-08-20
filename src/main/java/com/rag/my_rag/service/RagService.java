@@ -1,5 +1,7 @@
 package com.rag.my_rag.service;
 
+import com.rag.my_rag.config.PromptConfig;
+import com.rag.my_rag.config.RagProperties;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -42,17 +44,22 @@ public class RagService {
     private final VectorStore vectorStore;
     private final ChatModel chatModel;
     private final ObjectMapper objectMapper;
+    private final PromptConfig promptConfig;
+    private final RagProperties ragProperties;
 
-    public RagService(VectorStore vectorStore, ChatModel chatModel, ObjectMapper objectMapper) {
+    public RagService(VectorStore vectorStore, ChatModel chatModel, ObjectMapper objectMapper,
+                      PromptConfig promptConfig, RagProperties ragProperties) {
         this.vectorStore = vectorStore;
         this.chatModel = chatModel;
         this.objectMapper = objectMapper;
+        this.promptConfig = promptConfig;
+        this.ragProperties = ragProperties;
         System.out.println("✅ RagService 初始化成功，VectorStore: " + vectorStore.getClass().getSimpleName());
     }
 
     public void ingest(Resource file) throws IOException {
         String content = extractText(file);
-        List<String> chunks = splitText(content, 500, 50);
+        List<String> chunks = splitText(content, ragProperties.chunk().size(), ragProperties.chunk().overlap());
 
         List<Document> documents = chunks.stream()
                 .map(chunk -> Document.builder()
@@ -62,7 +69,7 @@ public class RagService {
                 .collect(Collectors.toList());
 
         // DashScope text-embedding-v3 单次请求最多 10 条，分批写入
-        int batchSize = 10;
+        int batchSize = ragProperties.chunk().batchSize();
         for (int i = 0; i < documents.size(); i += batchSize) {
             vectorStore.add(documents.subList(i, Math.min(i + batchSize, documents.size())));
         }
@@ -109,7 +116,7 @@ public class RagService {
         List<Document> relevantDocs = vectorStore.similaritySearch(
                 SearchRequest
                         .query(userQuestion)
-                        .withTopK(5)
+                        .withTopK(ragProperties.retrieval().topK())
         );
 
         String context = relevantDocs.stream()
@@ -148,15 +155,8 @@ public class RagService {
     }
 
     private String buildSystemPrompt(String context) {
-        return """
-                你是一个知识库问答助手。请仅根据下面的参考信息回答用户的问题。
-                如果参考信息中没有相关内容，请诚实地说"根据现有资料无法回答"，不要编造。
-
-                【参考信息】
-                %s
-
-                回答时请使用与用户相同的语言。
-                """.formatted(context);
+        // 提示词模板来自 prompts.yml，{{context}} 替换为检索到的参考信息
+        return promptConfig.getSystem().replace("{{context}}", context);
     }
 
     private String toJson(Map<String, String> payload) {
