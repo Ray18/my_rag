@@ -66,6 +66,13 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>5.10.2</version>   <!-- 建议使用最新稳定版，如 5.10.2 -->
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <dependencyManagement>

@@ -2,6 +2,8 @@ package com.rag.my_rag.service;
 
 import com.rag.my_rag.config.PromptConfig;
 import com.rag.my_rag.config.RagProperties;
+import com.rag.my_rag.service.chunking.ChunkStrategy;
+import com.rag.my_rag.service.chunking.ChunkStrategyResolver;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -46,20 +48,24 @@ public class RagService {
     private final ObjectMapper objectMapper;
     private final PromptConfig promptConfig;
     private final RagProperties ragProperties;
+    private final ChunkStrategy chunkStrategy;
 
     public RagService(VectorStore vectorStore, ChatModel chatModel, ObjectMapper objectMapper,
-                      PromptConfig promptConfig, RagProperties ragProperties) {
+                      PromptConfig promptConfig, RagProperties ragProperties,
+                      ChunkStrategyResolver chunkStrategyResolver) {
         this.vectorStore = vectorStore;
         this.chatModel = chatModel;
         this.objectMapper = objectMapper;
         this.promptConfig = promptConfig;
         this.ragProperties = ragProperties;
-        System.out.println("✅ RagService 初始化成功，VectorStore: " + vectorStore.getClass().getSimpleName());
+        this.chunkStrategy = chunkStrategyResolver.resolve();
+        System.out.println("✅ RagService 初始化成功，VectorStore: " + vectorStore.getClass().getSimpleName()
+                + "，切块策略: " + chunkStrategy.getClass().getSimpleName());
     }
 
     public void ingest(Resource file) throws IOException {
         String content = extractText(file);
-        List<String> chunks = splitText(content, ragProperties.chunk().size(), ragProperties.chunk().overlap());
+        List<String> chunks = chunkStrategy.split(content);
 
         List<Document> documents = chunks.stream()
                 .map(chunk -> Document.builder()
@@ -231,21 +237,4 @@ public class RagService {
         }
     }
 
-    private List<String> splitText(String text, int chunkSize, int overlap) {
-        List<String> chunks = new java.util.ArrayList<>();
-        String[] sentences = text.split("(?<=[。！？.!?])");
-        StringBuilder current = new StringBuilder();
-        for (String sentence : sentences) {
-            if (current.length() + sentence.length() > chunkSize && current.length() > 0) {
-                chunks.add(current.toString());
-                int start = Math.max(0, current.length() - overlap);
-                current = new StringBuilder(current.substring(start));
-            }
-            current.append(sentence);
-        }
-        if (current.length() > 0) {
-            chunks.add(current.toString());
-        }
-        return chunks;
-    }
 }

@@ -18,7 +18,7 @@
 
 三、整体架构与两条数据链路
 ─  知识摄入链路 (ingest)  
-│  上传文件 → 按扩展名分发解析(PDF/Word) → 按句子边界切块(带 overlap)                     
+│  上传文件 → 按扩展名分发解析(PDF/Word) → 策略化切块(规则/结构感知/语义聚类,默认语义)   
 │        → 分批调用百炼 text-embedding-v3 向量化 → 写入 Elasticsearch 向量库             
 
 |  问答链路 (query)  
@@ -31,22 +31,22 @@
 
 1. 配置层(3 个类,全部走 @ConfigurationProperties)
 
-- RagProperties.java —— 用 record 绑定 rag.* 配置:切块大小 500、重叠 50、向量写入每批 10 条、检索 top-k 5。MyRagApplication.java:8 上的 @ConfigurationPropertiesScan 让它们自动注册。
+- RagProperties.java —— 用 record 绑定 rag.* 配置:切块策略(rule/structural/semantic)、切块大小 500、重叠 50、向量写入每批 10 条、语义参数(threshold 0.7、window-sentences 5)、检索 top-k 5。MyRagApplication.java:8 上的 @ConfigurationPropertiesScan 让它们自动注册。
 - PromptConfig.java —— 绑定 rag.prompt.system,即提示词模板(占位符 {{context}})。提示词不在代码里,而在 prompts.yml,并通过 spring.config.import(application.properties:39)支持运行目录下的外部 prompts.yml 覆盖内置文件 → 改提示词无需重新编译。这是最近一次提交(35c71f1)做的优化。
 - DashScopeEmbeddingConfig.java —— 手动构建向量嵌入客户端(见第五节,项目亮点)。
 
 2. 接入层 RagController.java(3 个接口)
 
-│        接口        │       方法        │                      说明                      │
+│        接口        │       方法        │                      说明                  │
 │ POST /rag/ingest   │ 传 MultipartFile  │ 上传并向量化文档,同步返回成功提示              │
-│ GET /rag/query     │ question + 可选   │ 完整问答                                       │
-│                    │ history           │                                                │
-│ GET                │ 同上              │ SSE 流式问答,produces =                        │
-│ /rag/query/stream  │                   │ TEXT_EVENT_STREAM_VALUE,返回 Flux<String>      │
+│ GET /rag/query     │ question + 可选   │ 完整问答                                    │
+│                    │ history           │                                            │
+│ GET                │ 同上              │ SSE 流式问答,produces =                       │
+│ /rag/query/stream  │                   │ TEXT_EVENT_STREAM_VALUE,返回 Flux<String>    │
 
 3. 服务层 RagService.java(核心,分四块)
 
-① 文档解析 extractText(173-232 行)
+① 文档解析 extractText(179-240 行)
 按扩展名分发:
 - .doc(旧二进制格式)→ POI 的 HWPFDocument + WordExtractor;
 - .docx(OOXML)→ XWPFDocument,遍历 bodyElements,按文档顺序依次读出段落和表格(表格内逐行逐格拼接);
@@ -54,13 +54,16 @@
 
 空文本直接抛异常,提示"可能是扫描件/图片型文档,需要 OCR"——做了失败兜底。
 
-② 语义切块 splitText(234-250 行)
-正则 (?<=[。！？.!?]) 按句子边界切分,而不是按固定字符数硬切——避免把一句话的语义拦腰切断。超过 chunkSize(500)时截断,并保留尾部 overlap(50)个字符作为下一块开头,补偿上下文衔接。
+② 切块(策略化,service/chunking 包)
+以 ChunkStrategy 接口为扩展点,通过 rag.chunk.strategy 配置选择(默认 semantic),Resolver 按 Bean 名注入 Map 选出策略——加一种策略只需新增 @Component:
+- rule 规则法:按句读 (?<=[。！？.!?]) 切,超 size 收尾 + overlap 续接(原 splitText,零成本兜底);
+- structural 结构感知:检测 一、/(一)/1./1.1/第X章/# 等标题,按章节切块,标题保留在块内供 LLM 理解上下文,超长章节内部再规则法切;
+- semantic 语义聚类(默认):句子每 N(5)句组成窗口 → 批量(10 条/次)调百炼嵌入 → 相邻窗口余弦相似度 < threshold(0.7)即语义断点 → 超 size 的块规则法再切、末尾过小碎片并入前块;嵌入接口失败自动降级 rule,摄入链路不中断。
 
-③ 摄入写入 ingest(60-77 行)
+③ 摄入写入 ingest(66-82 行)
 每个块包成 Document,元数据带 source(文件名)→ 按 batch-size(10)分批调用 vectorStore.add(),注释说明了原因:text-embedding-v3 单次请求上限 10 条。
 
-④ 问答组装 query / queryStream / buildMessages(80-155 行)
+④ 问答组装 query / queryStream / buildMessages(86-161 行)
 两条路径复用同一个 buildMessages:
 1. vectorStore.similaritySearch(SearchRequest.query(question).withTopK(topK)) 召回 top-5 个块,拼成 context;
 2. 消息序列 = System(提示词模板替换 {{context}}) + 历史对话 + 当前问题;
@@ -93,9 +96,14 @@ DeepSeek 官方没有 embedding 接口,只有对话;而 Spring AI 的 OpenAI 模
 
 ▎ 面试话术:能讲出这个细节说明是真的跑通调试过的,不是照抄 demo。
 
-3. 切块策略:为什么按句子边界切
+3. 切块策略:从规则法到语义切分
 
-固定窗口切块会截断语义完整的句子;按中文句读(。！？)和英文句读(.!?)切,块与块之间再用 overlap 补上下文。当前是规则法(简单、快、无额外成本);更大的方向是语义切分(结构感知 / 向量相似度聚类 / LLM 分块),目前还未实施,是可扩展点。
+切块做成 ChunkStrategy 策略接口 + Resolver 按配置选 Bean,本身就是可扩展点:
+- 规则法 rule:按句读切,块尾 overlap 续接——简单、快、零成本,作为兜底;
+- 结构感知 structural:检测 一、/(一)/1./1.1/第X章/# 等标题,按章节切块,标题保留在块内;
+- 语义聚类 semantic(默认):句子每 5 句组成窗口 → 批量嵌入 → 相邻窗口余弦相似度低于阈值(0.7,可调)即语义断点 → 超 size 再规则法切、末尾碎片并入前块。嵌入失败自动降级规则法。
+
+▎ 面试话术:语义切分不是玄学——核心是"让块的边界落在语义自然断开处",用相邻句组的向量相似度判断断点,比固定窗口更贴合段落完整性和检索质量;复用已有的百炼嵌入模型,只多一次 ingest 时的向量调用。
 
 4. 流式输出的可靠性设计
 
@@ -123,16 +131,13 @@ DeepSeek 官方没有 embedding 接口,只有对话;而 Spring AI 的 OpenAI 模
 2. 缺少文档管理:只有 ingest,没有 delete / update / list,重复上传会产生重复块。
 3. 配置安全:api-key 明文写在 application.properties(未提交到 git 需要额外处理),生产应走环境变量 / 密钥管理。
 4. 不支持图片/扫描件:PDF 里如果只有图没有文本层会失败,未接 OCR。
-5. 切块仍是规则法:语义切分(A/B/C 方案)未实施,长文档的段落完整性和语义聚合有提升空间。
+5. 切块已策略化:A(结构感知)+ B(语义聚类)已落地、默认语义聚类;LLM 分块(C)留作扩展点——每次 ingest 需调 LLM 成本高,适合结构复杂的小规模文档,需要时按 ChunkStrategy 接口新增 @Component 即可。
 6. 无鉴权、无并发控制、ES 单机——定位是本地/演示级,生产化需要补齐。
 
 七、本地运行方式
 
 # 1. 启动 Elasticsearch 8.x(localhost:9200),保证账号密码与配置一致
-# 2. 编译(注意:本机 shell 默认 JDK 是 8,pom 要求 21)
-JAVA_HOME=/Users/luoyang/code/jdk21/Contents/Home ./mvnw compile
-# 3. 运行
-JAVA_HOME=/Users/luoyang/code/jdk21/Contents/Home ./mvnw spring-boot:run
-# 4. 浏览器打开 http://localhost:8080,上传 PDF/Word 后即可对话
+# 2. 编译(pom 要求 21)
+# 3. 浏览器打开 http://localhost:8080,上传 PDF/Word 后即可对话
 
 依赖的两个外部服务(ES + 两个模型 API)通过 application.properties 统一管理,initialize-schema=true 让 ES 首次启动自动建索引。
