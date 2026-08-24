@@ -6,6 +6,7 @@ import com.rag.my_rag.config.PromptConfig;
 import com.rag.my_rag.config.RagProperties;
 import com.rag.my_rag.dto.DocumentInfo;
 import com.rag.my_rag.dto.IngestResult;
+import com.rag.my_rag.dto.UserQuestionDto;
 import com.rag.my_rag.service.chunking.ChunkStrategy;
 import com.rag.my_rag.service.chunking.ChunkStrategyResolver;
 import com.rag.my_rag.service.retrieval.RetrievalService;
@@ -31,6 +32,11 @@ import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.apache.poi.hwpf.HWPFDocument;
 import org.apache.poi.hwpf.extractor.WordExtractor;
+import org.apache.poi.ss.usermodel.Cell;
+import org.apache.poi.ss.usermodel.DataFormatter;
+import org.apache.poi.ss.usermodel.Row;
+import org.apache.poi.ss.usermodel.Sheet;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.apache.poi.xwpf.usermodel.IBodyElement;
 import org.apache.poi.xwpf.usermodel.XWPFDocument;
 import org.apache.poi.xwpf.usermodel.XWPFParagraph;
@@ -40,6 +46,11 @@ import org.apache.poi.xwpf.usermodel.XWPFTableRow;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.Charset;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -159,9 +170,9 @@ public class RagService {
     }
 
     /** 问答接口：混合检索向量库后返回大模型生成的完整回答，支持多轮对话历史与按来源过滤 */
-    public String query(String userQuestion, String historyJson, String source) {
+    public String query(UserQuestionDto userQuestionDto) {
         try {
-            List<Message> messages = buildMessages(userQuestion, historyJson, source);
+            List<Message> messages = buildMessages(userQuestionDto);
             return chatModel.call(new Prompt(messages)).getResult().getOutput().getContent();
         } catch (Exception e) {
             e.printStackTrace();
@@ -173,9 +184,9 @@ public class RagService {
      * 流式查询：混合检索后用 SSE 逐个返回大模型生成的增量文本。
      * 每个 chunk 用 JSON 包裹（{"content": "..."}），避免模型输出里的换行/空行切断 SSE 事件流。
      */
-    public Flux<String> queryStream(String userQuestion, String historyJson, String source) {
+    public Flux<String> queryStream(UserQuestionDto userQuestionDto) {
         return Flux.defer(() -> {
-            List<Message> messages = buildMessages(userQuestion, historyJson, source);
+            List<Message> messages = buildMessages(userQuestionDto);
             return chatModel.stream(new Prompt(messages))
                     .map(resp -> {
                         String content = resp.getResult() != null && resp.getResult().getOutput() != null
@@ -194,10 +205,10 @@ public class RagService {
      * history 为 URL 编码的 JSON 数组：[{"role":"user","content":"..."},{"role":"assistant","content":"..."}]
      * source 为可选来源过滤(文件名),解析失败或为空时优雅降级为单轮问答。
      */
-    private List<Message> buildMessages(String userQuestion, String historyJson, String source) {
-        List<Document> relevantDocs = retrievalService.retrieve(userQuestion, source);
+    private List<Message> buildMessages(UserQuestionDto userQuestionDto) {
+        List<Document> relevantDocs = retrievalService.retrieve(userQuestionDto.getQuestion(), userQuestionDto.getSource());
         System.out.println("🔎 检索到 " + relevantDocs.size() + " 个上下文块"
-                + (source != null && !source.isBlank() ? "（限定来源: " + source + "）" : ""));
+                + (userQuestionDto.getSource() != null && !userQuestionDto.getSource().isBlank() ? "（限定来源: " + userQuestionDto.getSource() + "）" : ""));
 
         String context = relevantDocs.stream()
                 .map(Document::getContent)
@@ -206,10 +217,10 @@ public class RagService {
         List<Message> messages = new ArrayList<>();
         messages.add(new SystemMessage(buildSystemPrompt(context)));
 
-        if (historyJson != null && !historyJson.isBlank()) {
+        if (userQuestionDto.getHistory() != null && !userQuestionDto.getHistory().isBlank()) {
             try {
                 List<Map<String, String>> history = objectMapper.readValue(
-                        historyJson, new TypeReference<List<Map<String, String>>>() {
+                        userQuestionDto.getHistory(), new TypeReference<List<Map<String, String>>>() {
                         });
                 if (history != null) {
                     for (Map<String, String> turn : history) {
@@ -230,7 +241,7 @@ public class RagService {
             }
         }
 
-        messages.add(new UserMessage(userQuestion));
+        messages.add(new UserMessage(userQuestionDto.getQuestion()));
         return messages;
     }
 
@@ -249,7 +260,7 @@ public class RagService {
 
     // ===== 文档管理辅助方法 =====
 
-    /** 统计某个文档(按 metadata.source 精确匹配)当前有多少个块 */
+    /** 统计某个文档(按 metadata.source() 精确匹配)当前有多少个块 */
     private long countDocuments(String source) {
         try {
             var res = esClient.count(c -> c.index(indexName)
@@ -284,6 +295,10 @@ public class RagService {
         String text;
         if (lower.endsWith(".doc") || lower.endsWith(".docx")) {
             text = extractTextFromWord(file);
+        } else if (lower.endsWith(".xlsx")) {
+            text = extractTextFromExcel(file);
+        } else if (lower.endsWith(".txt")) {
+            text = extractTextFromTxt(file);
         } else {
             text = extractTextFromPdf(file);
         }
@@ -336,6 +351,55 @@ public class RagService {
             }
             return sb.toString();
         }
+    }
+
+    /** .txt 纯文本:按 UTF-8 读取并去掉 BOM;非 UTF-8(如 GBK 中文)自动回退解码 */
+    private String extractTextFromTxt(Resource txtFile) throws IOException {
+        byte[] bytes;
+        try (InputStream is = txtFile.getInputStream()) {
+            bytes = is.readAllBytes();
+        }
+        // 去掉 UTF-8 BOM(EF BB BF)
+        int offset = (bytes.length >= 3 && (bytes[0] & 0xFF) == 0xEF
+                && (bytes[1] & 0xFF) == 0xBB && (bytes[2] & 0xFF) == 0xBF) ? 3 : 0;
+        try {
+            return StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(bytes, offset, bytes.length - offset))
+                    .toString();
+        } catch (CharacterCodingException e) {
+            // 不是合法 UTF-8,按 GBK(常见中文 Windows 文本编码)回退
+            return new String(bytes, offset, bytes.length - offset, Charset.forName("GBK"));
+        }
+    }
+
+    /** .xlsx 电子表格:逐 Sheet / 逐行 / 逐格拼接为文本,单元格用制表符分隔;公式取计算缓存值 */
+    private String extractTextFromExcel(Resource excelFile) throws IOException {
+        DataFormatter formatter = new DataFormatter();
+        StringBuilder sb = new StringBuilder();
+        try (InputStream is = excelFile.getInputStream();
+             XSSFWorkbook workbook = new XSSFWorkbook(is)) {
+            for (int s = 0; s < workbook.getNumberOfSheets(); s++) {
+                Sheet sheet = workbook.getSheetAt(s);
+                sb.append("[Sheet: ").append(sheet.getSheetName()).append("]\n");
+                for (Row row : sheet) {
+                    boolean first = true;
+                    for (Cell cell : row) {
+                        String value = formatter.formatCellValue(cell);
+                        if (value == null || value.isEmpty()) {
+                            continue;
+                        }
+                        if (!first) {
+                            sb.append("\t");
+                        }
+                        first = false;
+                        sb.append(value);
+                    }
+                    sb.append("\n");
+                }
+            }
+        }
+        return sb.toString();
     }
 
 }

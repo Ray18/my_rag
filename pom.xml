@@ -73,6 +73,13 @@
             <version>5.10.2</version>   <!-- 建议使用最新稳定版，如 5.10.2 -->
             <scope>test</scope>
         </dependency>
+<!--        lombook-->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <version>1.18.38</version> <!-- 升级到最新稳定版 -->
+            <scope>provided</scope>
+        </dependency>
     </dependencies>
 
     <dependencyManagement>

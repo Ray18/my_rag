@@ -2,15 +2,12 @@ package com.rag.my_rag.controller;
 
 import com.rag.my_rag.dto.DocumentInfo;
 import com.rag.my_rag.dto.IngestResult;
+import com.rag.my_rag.dto.UserQuestionDto;
 import com.rag.my_rag.service.RagService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.DeleteMapping;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 import reactor.core.publisher.Flux;
@@ -55,19 +52,15 @@ class RagController {
     }
 
     // 4. 用户提问的接口（history 为可选的多轮对话历史；source 为可选来源过滤，只检索指定文档）
-    @GetMapping("/rag/query")
-    ResponseEntity<?> query(@RequestParam String question,
-                            @RequestParam(required = false) String history,
-                            @RequestParam(required = false) String source) {
-        String answer = ragService.query(question, history, source);
+    @PostMapping("/rag/query")
+    ResponseEntity<?> query(@RequestBody UserQuestionDto userQuestionDto) {
+        String answer = ragService.query(userQuestionDto);
         return ResponseEntity.ok(answer);
     }
 
     // 5. 流式提问接口（SSE，逐 token 返回 JSON 包裹的增量文本）
-    @GetMapping(value = "/rag/query/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    Flux<String> queryStream(@RequestParam String question,
-                             @RequestParam(required = false) String history,
-                             @RequestParam(required = false) String source) {
-        return ragService.queryStream(question, history, source);
+    @PostMapping(value = "/rag/query/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    Flux<String> queryStream(@RequestBody UserQuestionDto userQuestionDto) {
+        return ragService.queryStream(userQuestionDto);
     }
 }

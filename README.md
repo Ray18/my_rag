@@ -1,6 +1,6 @@
 一、一句话定位
 
-一个基于 RAG(检索增强生成)的知识库问答系统:上传 PDF / Word 文档,系统解析、切块、向量化后存入向量库;之后用户基于文档内容进行多轮对话,支持 SSE 流式输出。
+一个基于 RAG(检索增强生成)的知识库问答系统:上传 PDF / Word / Excel / TXT 文档,系统解析、切块、向量化后存入向量库;之后用户基于文档内容进行多轮对话,支持 SSE 流式输出。
 
 二、技术栈
 
@@ -10,7 +10,7 @@
 │ 对话大模型  │ DeepSeek deepseek-chat(OpenAI 兼容协议)                           
 │ 向量嵌入    │ 阿里云百炼 DashScope text-embedding-v3(OpenAI 兼容)               
 │ 向量数据库  │ Elasticsearch 8.x(cosine 相似度,1024 维)                          
-│ 文档解析    │ PDFBox 3.0(PDF)、Apache POI 5.2.5(Word,.doc + .docx)              
+│ 文档解析    │ PDFBox 3.0(PDF)、Apache POI 5.2.5(Word,.doc/.docx;Excel,.xlsx)、TXT              
 │ 前端        │ 原生 HTML/CSS/JS(无框架),SSE 流式 + 手写迷你 Markdown 渲染器      
 │ 构建        │ Maven(Spring Boot parent)                                         
 
@@ -18,7 +18,7 @@
 
 三、整体架构与两条数据链路
 ─  知识摄入链路 (ingest)  
-│  上传文件 → 按扩展名分发解析(PDF/Word) → 策略化切块(规则/结构感知/语义聚类,默认语义)   
+│  上传文件 → 按扩展名分发解析(PDF/Word/Excel/TXT) → 策略化切块(规则/结构感知/语义聚类,默认语义) 
 │        → 分批调用百炼 text-embedding-v3 向量化 → 写入 Elasticsearch 向量库             
 │  同名文件重传 = 替换(幂等 upsert),不产生重复块
 
@@ -52,10 +52,12 @@
 
 3. 服务层 RagService.java(核心,分五块)
 
-① 文档解析 extractText(179-240 行)
+① 文档解析 extractText(290-402 行)
 按扩展名分发:
 - .doc(旧二进制格式)→ POI 的 HWPFDocument + WordExtractor;
 - .docx(OOXML)→ XWPFDocument,遍历 bodyElements,按文档顺序依次读出段落和表格(表格内逐行逐格拼接);
+- .xlsx(Excel)→ XSSFWorkbook,逐 Sheet / 逐行 / 逐格拼接为文本,单元格用制表符分隔,公式取计算缓存值;
+- .txt(纯文本)→ 按 UTF-8 读取并去掉 BOM,非 UTF-8(常见 GBK 中文)自动回退解码;
 - 其余默认按 PDF → PDFBox 3.0 的 Loader.loadPDF + PDFTextStripper。
 
 空文本直接抛异常,提示"可能是扫描件/图片型文档,需要 OCR"——做了失败兜底。
@@ -152,11 +154,12 @@ Spring AI M4 的 ElasticsearchVectorStore 只做 kNN 检索,不支持混合检�
 3. 不支持图片/扫描件:PDF 里如果只有图没有文本层会失败,未接 OCR。
 4. 切块已策略化:A(结构感知)+ B(语义聚类)已落地、默认语义聚类;LLM 分块(C)留作扩展点——每次 ingest 需调 LLM 成本高,适合结构复杂的小规模文档,需要时按 ChunkStrategy 接口新增 @Component 即可。
 5. 无鉴权、无并发控制、ES 单机——定位是本地/演示级,生产化需要补齐。
+6. 缺少对txt、md、html、htm、xml等文档的解析
 
 七、本地运行方式
 
 # 1. 启动 Elasticsearch 8.x(localhost:9200),保证账号密码与配置一致
 # 2. 编译(pom 要求 21)
-# 3. 浏览器打开 http://localhost:8080,上传 PDF/Word 后即可对话
+# 3. 浏览器打开 http://localhost:8080,上传 PDF/Word/Excel/TXT 后即可对话
 
 依赖的两个外部服务(ES + 两个模型 API)通过 application.properties 统一管理,initialize-schema=true 让 ES 首次启动自动建索引。

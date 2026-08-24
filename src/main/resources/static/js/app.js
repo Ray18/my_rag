@@ -20,7 +20,7 @@
 
   // ===== 状态 =====
   const MAX_HISTORY_TURNS = 8;   // 发送给后端的最近对话轮数（GET URL 长度限制）
-  const ALLOWED_EXT = ['.pdf', '.doc', '.docx'];
+  const ALLOWED_EXT = ['.pdf', '.doc', '.docx','.xls','.xlsx','.txt'];
   const MAX_SIZE = 50 * 1024 * 1024;
 
   let history = [];              // [{role:'user'|'assistant', content}, ...]
@@ -189,12 +189,22 @@
     setStreamingUI(true);
     abortController = new AbortController();
 
-    const params = new URLSearchParams({ question });
-    params.set('history', JSON.stringify(historyToSend));
-    const url = '/rag/query/stream?' + params.toString();
+      const params = {
+          question: question,
+          history: JSON.stringify(historyToSend),
+          source:  ""
+      };
 
-    try {
-      const res = await fetch(url, { signal: abortController.signal });
+    const url = '/rag/query/stream';
+      try {
+        const res = await fetch(url, {
+            signal: abortController.signal,
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(params)
+        });
       if (!res.ok) {
         const body = await res.text();
         throw new Error('HTTP ' + res.status + (body ? '（' + body.slice(0, 120) + '）' : ''));
@@ -281,7 +291,7 @@
   async function uploadFile(file) {
     const ext = extOf(file.name);
     if (!ALLOWED_EXT.includes(ext)) {
-      showToast('不支持的文件类型：' + (ext || '未知') + '，仅支持 PDF / Word');
+      showToast('不支持的文件类型：' + (ext || '未知') + '，仅支持 PDF / Word / Excel /TXT');
       return;
     }
     if (file.size > MAX_SIZE) {
