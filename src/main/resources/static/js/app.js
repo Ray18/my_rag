@@ -15,6 +15,7 @@
   const uploadStatus = $('#uploadStatus');
   const docList = $('#docList');
   const docEmpty = $('#docEmpty');
+  const docCount = $('#docCount');
   const toastEl = $('#toast');
 
   // ===== 状态 =====
@@ -295,14 +296,14 @@
       fd.append('file', file);
 
       const res = await fetch('/rag/ingest', { method: 'POST', body: fd });
-      const text = await res.text();
-      if (!res.ok) throw new Error(text.trim() || 'HTTP ' + res.status);
+      const body = await res.json().catch(() => null);
+      if (!res.ok) throw new Error((body && body.message) || 'HTTP ' + res.status);
 
       item.classList.remove('uploading');
       item.classList.add('ok');
-      item.querySelector('.upload-state').textContent = '✓ 已上传';
-      addDoc(file.name);
-      showToast('《' + file.name + '》上传并向量化成功');
+      item.querySelector('.upload-state').textContent = body && body.replaced ? '✓ 已替换' : '✓ 已上传';
+      showToast((body && body.message) || '《' + file.name + '》上传并向量化成功');
+      await loadDocs();
     } catch (err) {
       item.classList.remove('uploading');
       item.classList.add('err');
@@ -311,12 +312,67 @@
     }
   }
 
-  function addDoc(name) {
-    docEmpty.hidden = true;
-    const li = document.createElement('li');
-    li.innerHTML = '<span class="doc-icon">📄</span>'
-                 + '<span class="doc-name">' + escapeHtml(name) + '</span>';
-    docList.appendChild(li);
+  // ============================================================
+  // 文档列表（以服务端为准：列表 + 删除 + 数量）
+  // ============================================================
+  async function loadDocs() {
+    try {
+      const res = await fetch('/rag/docs');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const docs = await res.json();
+      renderDocs(Array.isArray(docs) ? docs : []);
+    } catch (err) {
+      showToast('加载文档列表失败：' + err.message.slice(0, 80));
+    }
+  }
+
+  function renderDocs(docs) {
+    docList.innerHTML = '';
+    docEmpty.hidden = docs.length > 0;
+    docCount.hidden = docs.length === 0;
+    if (docs.length > 0) docCount.textContent = docs.length;
+
+    for (const d of docs) {
+      const li = document.createElement('li');
+
+      const icon = document.createElement('span');
+      icon.className = 'doc-icon';
+      icon.textContent = '📄';
+
+      const info = document.createElement('div');
+      info.className = 'doc-info';
+      const name = document.createElement('span');
+      name.className = 'doc-name';
+      name.textContent = d.name;
+      name.title = d.name;
+      const meta = document.createElement('span');
+      meta.className = 'doc-meta';
+      meta.textContent = d.chunkCount + ' 块';
+      info.append(name, meta);
+
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'doc-del';
+      del.textContent = '删除';
+      del.title = '删除《' + d.name + '》';
+      del.addEventListener('click', () => deleteDoc(d.name));
+
+      li.append(icon, info, del);
+      docList.appendChild(li);
+    }
+  }
+
+  async function deleteDoc(name) {
+    if (!confirm('确定要删除《' + name + '》吗？其所有分块将一并从知识库移除。')) return;
+    try {
+      const res = await fetch('/rag/docs?name=' + encodeURIComponent(name), { method: 'DELETE' });
+      const body = await res.json().catch(() => null);
+      if (!res.ok) throw new Error((body && body.message) || 'HTTP ' + res.status);
+      showToast((body && body.message) || '《' + name + '》已删除');
+      await loadDocs();
+    } catch (err) {
+      showToast('删除失败：' + err.message.slice(0, 80));
+    }
   }
 
   // ============================================================
@@ -423,4 +479,5 @@
 
   renderWelcome();
   chatInput.focus();
+  loadDocs();   // 启动时加载文档列表
 })();

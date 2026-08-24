@@ -17,6 +17,18 @@ public record RagProperties(Chunk chunk, Retrieval retrieval) {
     /** 语义切块参数:threshold 相邻窗口余弦相似度低于该值即视为语义断点,windowSentences 每个嵌入窗口包含的句子数 */
     public record Semantic(double threshold, int windowSentences) {}
 
-    /** 检索参数:topK 每次问答召回的参考文档块数 */
-    public record Retrieval(int topK) {}
+    /**
+     * 检索参数:topK 最终进入上下文的块数,candidateN 混合检索每腿召回候选数,
+     * hybrid BM25+向量混合检索开关与 RRF 融合常数,rerank 精排参数。
+     */
+    public record Retrieval(int topK, int candidateN, Hybrid hybrid, Rerank rerank) {}
+
+    /** 混合检索参数:enabled 是否启用 BM25+向量双路召回,rrfK 倒数秩融合常数(标准值 60,越小越强调高位次) */
+    public record Hybrid(boolean enabled, double rrfK) {}
+
+    /**
+     * 精排参数:enabled 是否调用 DashScope rerank,model 模型名(gte-rerank-v2 / qwen3-rerank),
+     * url 文本排序 HTTP 端点,apiKey 百炼 API Key(默认复用 embedding key),timeoutSeconds 超时,失败自动降级为 RRF 排序。
+     */
+    public record Rerank(boolean enabled, String model, String url, String apiKey, int timeoutSeconds) {}
 }

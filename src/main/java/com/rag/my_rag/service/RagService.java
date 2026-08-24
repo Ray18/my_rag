@@ -1,9 +1,14 @@
 package com.rag.my_rag.service;
 
+import co.elastic.clients.elasticsearch.ElasticsearchClient;
+import co.elastic.clients.elasticsearch.core.SearchResponse;
 import com.rag.my_rag.config.PromptConfig;
 import com.rag.my_rag.config.RagProperties;
+import com.rag.my_rag.dto.DocumentInfo;
+import com.rag.my_rag.dto.IngestResult;
 import com.rag.my_rag.service.chunking.ChunkStrategy;
 import com.rag.my_rag.service.chunking.ChunkStrategyResolver;
+import com.rag.my_rag.service.retrieval.RetrievalService;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -14,8 +19,8 @@ import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.document.Document;
-import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.Resource;
 import org.springframework.stereotype.Service;
 
@@ -49,43 +54,114 @@ public class RagService {
     private final PromptConfig promptConfig;
     private final RagProperties ragProperties;
     private final ChunkStrategy chunkStrategy;
+    private final RetrievalService retrievalService;
+    private final ElasticsearchClient esClient;
+    private final String indexName;
 
     public RagService(VectorStore vectorStore, ChatModel chatModel, ObjectMapper objectMapper,
                       PromptConfig promptConfig, RagProperties ragProperties,
-                      ChunkStrategyResolver chunkStrategyResolver) {
+                      ChunkStrategyResolver chunkStrategyResolver,
+                      RetrievalService retrievalService, ElasticsearchClient esClient,
+                      @Value("${spring.ai.vectorstore.elasticsearch.index-name}") String indexName) {
         this.vectorStore = vectorStore;
         this.chatModel = chatModel;
         this.objectMapper = objectMapper;
         this.promptConfig = promptConfig;
         this.ragProperties = ragProperties;
         this.chunkStrategy = chunkStrategyResolver.resolve();
+        this.retrievalService = retrievalService;
+        this.esClient = esClient;
+        this.indexName = indexName;
         System.out.println("✅ RagService 初始化成功，VectorStore: " + vectorStore.getClass().getSimpleName()
                 + "，切块策略: " + chunkStrategy.getClass().getSimpleName());
     }
 
-    public void ingest(Resource file) throws IOException {
+    /**
+     * 摄入文档(幂等 upsert):同名文档已存在则先删除旧块再写入,相当于「更新」,
+     * 重试上传不会产生重复块,历史遗留的重复块也在重传时一并清理。
+     */
+    public IngestResult ingest(Resource file, long fileSize) throws IOException {
+        String filename = file.getFilename();
+        if (filename == null || filename.isBlank()) {
+            throw new IllegalArgumentException("文件名不能为空");
+        }
         String content = extractText(file);
         List<String> chunks = chunkStrategy.split(content);
 
-        List<Document> documents = chunks.stream()
-                .map(chunk -> Document.builder()
-                        .withContent(chunk)
-                        .withMetadata(Map.of("source", file.getFilename()))
-                        .build())
-                .collect(Collectors.toList());
+        boolean replaced = countDocuments(filename) > 0;
+        if (replaced) {
+            deleteBySource(filename);
+        }
+
+        long now = System.currentTimeMillis();
+        List<Document> documents = new ArrayList<>(chunks.size());
+        for (int i = 0; i < chunks.size(); i++) {
+            documents.add(Document.builder()
+                    .withContent(chunks.get(i))
+                    .withMetadata(Map.of(
+                            "source", filename,      // 文档身份 = 文件名
+                            "docId", filename,
+                            "chunkIndex", i,
+                            "uploadedAt", now,       // epoch 毫秒,供文档列表展示
+                            "fileSize", fileSize))
+                    .build());
+        }
 
         // DashScope text-embedding-v3 单次请求最多 10 条，分批写入
         int batchSize = ragProperties.chunk().batchSize();
         for (int i = 0; i < documents.size(); i += batchSize) {
             vectorStore.add(documents.subList(i, Math.min(i + batchSize, documents.size())));
         }
-        System.out.println("✅ 文档已存储，共 " + documents.size() + " 个块");
+        System.out.println((replaced ? "✅ 文档已替换" : "✅ 文档已新建")
+                + "，共 " + documents.size() + " 个块");
+        String message = replaced
+                ? "文档「" + filename + "」已替换（共 " + documents.size() + " 个块）"
+                : "文档「" + filename + "」上传并向量化成功（共 " + documents.size() + " 个块）";
+        return new IngestResult(message, replaced, documents.size());
     }
 
-    /** 问答接口：检索向量库后返回大模型生成的完整回答，支持多轮对话历史 */
-    public String query(String userQuestion, String historyJson) {
+    /** 列出知识库中的文档(文件名 + 块数 + 最近上传时间),按最近上传倒序 */
+    public List<DocumentInfo> listDocuments() {
         try {
-            List<Message> messages = buildMessages(userQuestion, historyJson);
+            SearchResponse<Document> res = esClient.search(s -> s
+                    .index(indexName)
+                    .size(0)
+                    .aggregations("sources", a -> a
+                            .terms(t -> t.field("metadata.source.keyword").size(500))
+                            .aggregations("latestUpload", a2 -> a2.min(m -> m.field("metadata.uploadedAt")))),
+                    Document.class);
+            List<DocumentInfo> docs = new ArrayList<>();
+            var aggs = res.aggregations();
+            if (aggs == null || aggs.get("sources") == null || !aggs.get("sources").isSterms()) {
+                return docs;
+            }
+            for (var bucket : aggs.get("sources").sterms().buckets().array()) {
+                String name = bucket.key().stringValue();
+                long chunkCount = bucket.docCount();
+                long uploadedAt = 0L;
+                var sub = bucket.aggregations();
+                if (sub != null && sub.get("latestUpload") != null
+                        && sub.get("latestUpload").isMin()) {
+                    uploadedAt = (long) sub.get("latestUpload").min().value();
+                }
+                docs.add(new DocumentInfo(name, chunkCount, uploadedAt));
+            }
+            docs.sort((a, b) -> Long.compare(b.uploadedAt(), a.uploadedAt()));
+            return docs;
+        } catch (IOException e) {
+            throw new RuntimeException("列出文档失败: " + e.getMessage(), e);
+        }
+    }
+
+    /** 删除文档的全部块,返回删除的块数(文档不存在返回 0) */
+    public long deleteDocument(String name) {
+        return deleteBySource(name);
+    }
+
+    /** 问答接口：混合检索向量库后返回大模型生成的完整回答，支持多轮对话历史与按来源过滤 */
+    public String query(String userQuestion, String historyJson, String source) {
+        try {
+            List<Message> messages = buildMessages(userQuestion, historyJson, source);
             return chatModel.call(new Prompt(messages)).getResult().getOutput().getContent();
         } catch (Exception e) {
             e.printStackTrace();
@@ -94,12 +170,12 @@ public class RagService {
     }
 
     /**
-     * 流式查询：检索向量库后用 SSE 逐个返回大模型生成的增量文本。
+     * 流式查询：混合检索后用 SSE 逐个返回大模型生成的增量文本。
      * 每个 chunk 用 JSON 包裹（{"content": "..."}），避免模型输出里的换行/空行切断 SSE 事件流。
      */
-    public Flux<String> queryStream(String userQuestion, String historyJson) {
+    public Flux<String> queryStream(String userQuestion, String historyJson, String source) {
         return Flux.defer(() -> {
-            List<Message> messages = buildMessages(userQuestion, historyJson);
+            List<Message> messages = buildMessages(userQuestion, historyJson, source);
             return chatModel.stream(new Prompt(messages))
                     .map(resp -> {
                         String content = resp.getResult() != null && resp.getResult().getOutput() != null
@@ -116,14 +192,12 @@ public class RagService {
     /**
      * 组装多轮消息：System(检索到的资料) + 历史对话 + 当前问题。
      * history 为 URL 编码的 JSON 数组：[{"role":"user","content":"..."},{"role":"assistant","content":"..."}]
-     * 解析失败或为空时优雅降级为单轮问答。
+     * source 为可选来源过滤(文件名),解析失败或为空时优雅降级为单轮问答。
      */
-    private List<Message> buildMessages(String userQuestion, String historyJson) {
-        List<Document> relevantDocs = vectorStore.similaritySearch(
-                SearchRequest
-                        .query(userQuestion)
-                        .withTopK(ragProperties.retrieval().topK())
-        );
+    private List<Message> buildMessages(String userQuestion, String historyJson, String source) {
+        List<Document> relevantDocs = retrievalService.retrieve(userQuestion, source);
+        System.out.println("🔎 检索到 " + relevantDocs.size() + " 个上下文块"
+                + (source != null && !source.isBlank() ? "（限定来源: " + source + "）" : ""));
 
         String context = relevantDocs.stream()
                 .map(Document::getContent)
@@ -173,7 +247,34 @@ public class RagService {
         }
     }
 
-    // ===== 辅助方法 =====
+    // ===== 文档管理辅助方法 =====
+
+    /** 统计某个文档(按 metadata.source 精确匹配)当前有多少个块 */
+    private long countDocuments(String source) {
+        try {
+            var res = esClient.count(c -> c.index(indexName)
+                    .query(q -> q.term(t -> t.field("metadata.source.keyword").value(source))));
+            return res.count();
+        } catch (IOException e) {
+            System.out.println("⚠️ 查询文档「" + source + "」块数失败(" + e.getMessage() + ")，按不存在处理");
+            return 0L;
+        }
+    }
+
+    /** 按 metadata.source 删除文档的全部块(delete_by_query 直接删,无需先把 id 拉回内存) */
+    private long deleteBySource(String source) {
+        try {
+            var res = esClient.deleteByQuery(d -> d
+                    .index(indexName)
+                    .query(q -> q.term(t -> t.field("metadata.source.keyword").value(source)))
+                    .refresh(true));
+            return res.deleted();
+        } catch (IOException e) {
+            throw new RuntimeException("删除文档「" + source + "」失败: " + e.getMessage(), e);
+        }
+    }
+
+    // ===== 文本解析 =====
 
     /** 按文件扩展名分发解析：.doc/.docx 走 POI，其余默认按 PDF 解析 */
     private String extractText(Resource file) throws IOException {

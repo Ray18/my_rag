@@ -14,37 +14,43 @@
 │ 前端        │ 原生 HTML/CSS/JS(无框架),SSE 流式 + 手写迷你 Markdown 渲染器      
 │ 构建        │ Maven(Spring Boot parent)                                         
 
-▎ 核心结构:pom.xml:18-19 声明 JDK 21 + Spring AI M4;application.properties 集中管理所有外部依赖的接入参数。
+▎ 核心结构:pom.xml:17-18 声明 JDK 21 + Spring AI M4;application.properties 集中管理所有外部依赖的接入参数。
 
 三、整体架构与两条数据链路
 ─  知识摄入链路 (ingest)  
 │  上传文件 → 按扩展名分发解析(PDF/Word) → 策略化切块(规则/结构感知/语义聚类,默认语义)   
 │        → 分批调用百炼 text-embedding-v3 向量化 → 写入 Elasticsearch 向量库             
+│  同名文件重传 = 替换(幂等 upsert),不产生重复块
 
 |  问答链路 (query)  
-│  用户提问 → 向量检索 top-5 → 组装 System 提示词({{context}} 替换) + 多轮历史            
+│  用户提问 → 混合检索(向量 kNN + BM25,RRF 融合) → 可选 source 过滤 → 百炼 rerank 精排 top-5  
+│        → 组装 System 提示词({{context}} 替换) + 多轮历史            
 │        → DeepSeek 生成 → 完整返回 / SSE 逐 token 流式返回                              
 
-一个关键设计:两条链路用了两个不同供应商的模型——对话用 DeepSeek、向量用百炼。这是本项目的核心亮点,细节见第五节。
+一个关键设计:两条链路用了两个不同供应商的模型——对话用 DeepSeek、向量用百炼,检索精排也用百炼。这是本项目的核心亮点,细节见第五节。
 
 四、核心模块逐层拆解
 
-1. 配置层(3 个类,全部走 @ConfigurationProperties)
+1. 配置层(4 个类,3 个走 @ConfigurationProperties)
 
-- RagProperties.java —— 用 record 绑定 rag.* 配置:切块策略(rule/structural/semantic)、切块大小 500、重叠 50、向量写入每批 10 条、语义参数(threshold 0.7、window-sentences 5)、检索 top-k 5。MyRagApplication.java:8 上的 @ConfigurationPropertiesScan 让它们自动注册。
-- PromptConfig.java —— 绑定 rag.prompt.system,即提示词模板(占位符 {{context}})。提示词不在代码里,而在 prompts.yml,并通过 spring.config.import(application.properties:39)支持运行目录下的外部 prompts.yml 覆盖内置文件 → 改提示词无需重新编译。这是最近一次提交(35c71f1)做的优化。
+- RagProperties.java —— 用 record 绑定 rag.* 配置:切块策略(rule/structural/semantic)、切块大小 500、重叠 50、向量写入每批 10 条、语义参数(threshold 0.7、window-sentences 5)、检索参数(top-k 5、candidate-n 20、hybrid BM25+向量开关与 rrf-k 60、rerank 精排的开关/model/url/api-key)。MyRagApplication.java:8 上的 @ConfigurationPropertiesScan 让它们自动注册。
+- PromptConfig.java —— 绑定 rag.prompt.system,即提示词模板(占位符 {{context}})。提示词不在代码里,而在 prompts.yml,并通过 spring.config.import 支持运行目录下的外部 prompts.yml 覆盖内置文件 → 改提示词无需重新编译。该改动由提交 35c71f1 引入。
 - DashScopeEmbeddingConfig.java —— 手动构建向量嵌入客户端(见第五节,项目亮点)。
+- ElasticsearchClientConfig.java —— 从 Spring AI 建好的 RestClient 复用一个高层 ElasticsearchClient Bean(与向量库内部同构),供 BM25 查询 / 文档聚合 / delete_by_query 使用。
 
-2. 接入层 RagController.java(3 个接口)
+2. 接入层 RagController.java(5 个接口)
 
 │        接口        │       方法        │                      说明                  │
-│ POST /rag/ingest   │ 传 MultipartFile  │ 上传并向量化文档,同步返回成功提示              │
+│ POST /rag/ingest   │ 传 MultipartFile  │ 上传并向量化文档;同名重传=替换(幂等 upsert),  │
+│                    │                   │ 返回 IngestResult{message, replaced, chunkCount}│
+│ GET /rag/docs      │ 无               │ 文档列表:文件名 + 块数 + 最近上传时间           │
+│ DELETE /rag/docs   │ name(query 参数) │ 删除指定文档全部块,返回删除块数;不存在返回 404   │
 │ GET /rag/query     │ question + 可选   │ 完整问答                                    │
-│                    │ history           │                                            │
+│                    │ history + source │ (source=只检索指定文档)                      │
 │ GET                │ 同上              │ SSE 流式问答,produces =                       │
 │ /rag/query/stream  │                   │ TEXT_EVENT_STREAM_VALUE,返回 Flux<String>    │
 
-3. 服务层 RagService.java(核心,分四块)
+3. 服务层 RagService.java(核心,分五块)
 
 ① 文档解析 extractText(179-240 行)
 按扩展名分发:
@@ -60,16 +66,19 @@
 - structural 结构感知:检测 一、/(一)/1./1.1/第X章/# 等标题,按章节切块,标题保留在块内供 LLM 理解上下文,超长章节内部再规则法切;
 - semantic 语义聚类(默认):句子每 N(5)句组成窗口 → 批量(10 条/次)调百炼嵌入 → 相邻窗口余弦相似度 < threshold(0.7)即语义断点 → 超 size 的块规则法再切、末尾过小碎片并入前块;嵌入接口失败自动降级 rule,摄入链路不中断。
 
-③ 摄入写入 ingest(66-82 行)
-每个块包成 Document,元数据带 source(文件名)→ 按 batch-size(10)分批调用 vectorStore.add(),注释说明了原因:text-embedding-v3 单次请求上限 10 条。
+③ 摄入写入 ingest(幂等 upsert)
+先按 metadata.source.keyword 精确匹配检查同名文档:已存在则 delete_by_query 清掉旧块(顺带清理历史遗留的重复块)再写入,重传等同"更新"。每个块包成 Document,元数据带 source / docId / chunkIndex / uploadedAt / fileSize,按 batch-size(10)分批调用 vectorStore.add()——text-embedding-v3 单次请求上限 10 条。
 
-④ 问答组装 query / queryStream / buildMessages(86-161 行)
-两条路径复用同一个 buildMessages:
-1. vectorStore.similaritySearch(SearchRequest.query(question).withTopK(topK)) 召回 top-5 个块,拼成 context;
+④ 问答组装 query / queryStream / buildMessages
+两条路径复用同一个 buildMessages,检索交给独立的 RetrievalService(见第五节第 8 点):
+1. retrievalService.retrieve(question, source) 混合检索召回候选:向量腿(kNN top-20)+ BM25 腿(multi_match top-20)→ RRF 倒数秩融合 → 可选 source 精确过滤 → rerank 开启时调百炼 gte-rerank-v2 精排 → 取 top-5 拼成 context;
 2. 消息序列 = System(提示词模板替换 {{context}}) + 历史对话 + 当前问题;
 3. 历史 history 是 URL 编码的 JSON 数组 [{"role","content"},...],解析失败优雅降级为单轮问答(不报错)。
 
 流式接口用 Flux.defer + chatModel.stream(),每个增量用 {"content":"..."} JSON 包裹——因为模型输出里的换行/空行会切断 SSE 帧,包一层 JSON 保证事件流完整;出错时也返回 {"error":...} 给前端,不中断连接。
+
+⑤ 文档管理 listDocuments / deleteDocument
+文档身份 = 文件名。list 用 ES terms 聚合 metadata.source.keyword + min 子聚合取最近上传时间;delete 用 delete_by_query 按 term 精确删除整篇文档的块,无需把 id 拉回内存。文件名走 query 参数传递,规避中文/空格在 URL 路径里的转义问题。
 
 4. 前端(原生三件套,零依赖)
 
@@ -125,14 +134,24 @@ DeepSeek 官方没有 embedding 接口,只有对话;而 Spring AI 的 OpenAI 模
 
 没有引入 marked 等库,自写渲染器并先转义再还原,用私有区字符做临时占位,从根上规避 AI 输出里的 HTML 注入。
 
+8. 检索质量:从"固定 top-5 纯向量"升级为"混合检索 + rerank 精排"
+
+Spring AI M4 的 ElasticsearchVectorStore 只做 kNN 检索,不支持混合检索;VectorStore 接口也只能按文档 id 删除。为不动向量库内部实现,检索与文档管理都通过自建的 ElasticsearchClient 直查 ES:
+
+- 双路召回:向量腿复用现有 kNN store(top-20);BM25 腿直查 ES multi_match(content^2, metadata.source^1)+ fuzziness AUTO(top-20);
+- RRF 融合:1/(k + rank) 两腿求和、按文档 id 去重排序(k 标准值 60),纯 Java 实现,不依赖 ES 版本;同一文档在两条腿同时命中会获得更高融合分;
+- rerank 精排:融合候选交给百炼 gte-rerank-v2 文本排序,按语义相关度重排取 top-5。任何失败(无权限/超时/网络/解析)自动降级为 RRF 序,问答链路不中断;
+- 按来源过滤:query 带 source 参数只检索指定文档;过滤在 Java 侧按 metadata.source 精确匹配,避开 query_string 对中文/空格文件名的转义坑。
+
+▎ 面试话术:这是典型的两段式检索(candidate generation + reranking)——先用便宜的混合召回拿到足够广的候选,再用更强的排序模型精排,兼顾召回率与精度;rerank 失败降级 + 混合检索可配置开关,体现"默认稳、可权衡"的设计思路。
+
 六、已知限制与可优化方向(面试加分项:能说出"我知道它哪里不行")
 
-1. 检索质量:固定 top-5,无 rerank,无 混合检索(BM25 + 向量)。可加 reranker 模型或按文档类型调参。
-2. 缺少文档管理:只有 ingest,没有 delete / update / list,重复上传会产生重复块。
-3. 配置安全:api-key 明文写在 application.properties(未提交到 git 需要额外处理),生产应走环境变量 / 密钥管理。
-4. 不支持图片/扫描件:PDF 里如果只有图没有文本层会失败,未接 OCR。
-5. 切块已策略化:A(结构感知)+ B(语义聚类)已落地、默认语义聚类;LLM 分块(C)留作扩展点——每次 ingest 需调 LLM 成本高,适合结构复杂的小规模文档,需要时按 ChunkStrategy 接口新增 @Component 即可。
-6. 无鉴权、无并发控制、ES 单机——定位是本地/演示级,生产化需要补齐。
+1. 混合检索的 BM25 腿对纯中文正文效果有限:ES 标准分词器对中文不分词,BM25 对含英文/数字/标识符的内容更有效。要更强的中文词汇匹配需在 ES 安装 IK 分词插件并重建映射(向量腿 + rerank 已兜底,hybrid 可关)。
+2. 配置安全:api-key 明文写在 application.properties(未提交到 git 需要额外处理),生产应走环境变量 / 密钥管理。
+3. 不支持图片/扫描件:PDF 里如果只有图没有文本层会失败,未接 OCR。
+4. 切块已策略化:A(结构感知)+ B(语义聚类)已落地、默认语义聚类;LLM 分块(C)留作扩展点——每次 ingest 需调 LLM 成本高,适合结构复杂的小规模文档,需要时按 ChunkStrategy 接口新增 @Component 即可。
+5. 无鉴权、无并发控制、ES 单机——定位是本地/演示级,生产化需要补齐。
 
 七、本地运行方式
 
